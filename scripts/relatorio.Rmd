@@ -1,0 +1,573 @@
+---
+title: "Exercício - MT2 Data"
+output: pdf_document
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(message = FALSE)
+knitr::opts_chunk$set(warning  = FALSE)
+
+
+```
+
+
+# Sumário Excutivo
+
+## Principais Achados
+
+A análise do mercado da soja, com base nos dados de 2012 a 2024, demonstra que o preço doméstico da soja é fortemente influenciado pelo preço internacional da commodity e pela taxa de câmbio. As evidências empíricas indicam que choques negativos no preço internacional tendem a reduzir o preço doméstico. Além disso, variáveis como fertilizantes, produção doméstica e eventos climáticos (El Niño) também apresentaram certa relevância no comportamento da série.
+
+## Modelo Recomendado
+
+O modelo recomendado é um ARIMA com variáveis exógenas (ARIMAX), ajustado sobre a série mensal de preços domésticos da soja. Esse modelo se aprensetou bem especificado, tendo em vista resíduos ruído branco e ausência de autocorrelação dos resíduous. O uso de regressores externas — câmbio, preço global da soja, valor das exportações, custos de fertilizantes e choques climáticos — aumenta a capacidade explicativa em relação a modelos univariados, permitindo capturar a influência de fatores internacionais e domésticos sobre a formação de preços internos.
+
+## Implicações Econômicas para a Empresa
+
+Os resultados evidenciam a alta sensibilidade do mercado interno às oscilações internacionais, sobretudo do preço global da soja e do câmbio. Para a empresa, isso implica que:
+
+Gestão de risco cambial é essencial, uma vez que variações no câmbio amplificam os impactos externos sobre o preço doméstico.
+
+Monitoramento do mercado internacional deve ser contínuo, dado o papel central do preço global da soja na formação dos preços internos.
+
+Planejamento de produção e comercialização deve considerar cenários de queda internacional, já que a redução da rentabilidade pode afetar margens e exigir ajustes na estratégia de hedge.
+
+Eventos climáticos e custos de insumos (fertilizantes) permanecem como fatores críticos para a previsibilidade e devem ser integrados a análises prospectivas.
+
+Em síntese, a empresa deve adotar estratégias de hedge cambial e de preço alinhadas ao modelo ARIMAX, que permite antecipar movimentos de mercado e reduzir exposição a choques externos, fortalecendo a tomada de decisão em um ambiente de elevada volatilidade.
+
+# Dados
+
+- Para a elaboração do modelo, utilizou-se como variável dependente o indicador de preço da soja Cepea/Esalq – Paranaguá à vista (R$/60kg) (disponível em: https://www.cepea.org.br/br/indicador/soja.aspx
+). Como os dados possuem periodicidade diária, os valores foram agregados em médias mensais.
+
+- Ademais, como variáveis explicativas, utilizaram-se os dados disponibilizados pelo exercício, aos quais foram adicionados: (i) o valor das exportações brasileiras de soja, mensurado em US$ FOB milhões (disponível em: https://balanca.economia.gov.br/balanca/publicacoes_dados_consolidados/pg.html
+), e (ii) o preço global da soja, medido em USD/t (disponível em: https://fred.stlouisfed.org/series/PSOYBUSDM
+). Para a primeira variável, seu valor foi convertido para reais multiplicando-se pelo câmbio; para a segunda, aplicou-se a multiplicação pelo câmbio e pelo fator 0,06 (1 tonelada = 1000 kg), de modo a adequá-la à unidade de R\$/60 kg da variável dependente.
+
+
+```{r}
+
+# 1) Pacotes -------------------------------------------
+
+library('tidyverse')
+library('janitor')
+library('readxl')
+library("tseries")
+library("forecast")
+library('knitr')
+library("patchwork")
+library("strucchange")
+
+
+
+
+# 2) Dados -----------------------------------------------------------------
+
+# Alterar esse endereço para reprodução do relatório
+caminho_dados <- "C:/Users/lucac/OneDrive/Documentos/MT2_Data_exercicio/inputs/data.xlsx"
+
+# 2.1) Preço da soja ------------------------------------------------------
+
+soybean_price <- read_excel(caminho_dados, sheet = "soybean_price") %>%
+  clean_names() %>%
+  mutate(date = if (is.numeric(date)) {
+    as.Date(date, origin = "1899-12-30")
+  } else {
+    as.Date(date, tryFormats = c("%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y"))
+  }) %>%
+  mutate(year  = year(date), month = month(date)) %>%
+  group_by(year, month) %>%
+  summarise(soybean_price = mean(soybean_price, na.rm = TRUE),
+            .groups = "drop") %>%
+  mutate(date = as.Date(sprintf("%04d-%02d-01", year, month))) %>%
+ dplyr::select(-year,-month)
+
+# 2.2) Valor das exportações de soja ----------------------------------------------
+
+soybean_exp_value <- read_excel(
+  caminho_dados,
+  sheet = 'exp_value'
+) %>%
+  clean_names() %>%
+  mutate(date = as.Date(paste0("01/", date), format = "%d/%m/%Y")) %>% 
+arrange(date)
+
+
+# 2.3) Valor das exportações de soja ----------------------------------------------
+
+soybean_global_price <- read_excel(
+  caminho_dados,
+  sheet = 'soybean_global_price'
+) %>% clean_names()
+
+
+# 2.3) Dados do exercício  ----------------------------------------------
+
+data_raw <- read_excel(caminho_dados) %>%
+  clean_names() %>%
+  rename(
+    fx = bcb_external_sec_exchange_rate_dolar_month_avg,
+    commodity_fertilizers = wb_commodity_fertilizers,
+    el_nino = noaa_oni,
+    soybean_prod = ibge_lspa_soybean_production
+  )
+
+
+# 2.4) Dataset ------------------------------------------------------------
+
+dataset <- data_raw %>%
+  left_join(soybean_exp_value, by = "date") %>%
+  left_join(soybean_global_price, by = "date") %>%
+  left_join(soybean_price, by = "date") %>%
+  mutate(soybean_global_price = soybean_global_price * fx * 0.06,
+         exp_value = exp_value*fx) %>%
+  pivot_longer(
+    cols = -c(date),
+    names_to = "series",
+    values_to = "value"
+  )
+
+
+
+ggplot(dataset, aes(x = date, y = value)) +
+  geom_line(color = "steelblue") +
+  facet_wrap( ~ series, scales = "free_y", ncol = 2) +
+  theme_minimal() +
+  labs(title = "Time Series", x = "Time", y = "Value")
+
+```
+
+```{r, echo=FALSE}
+
+kable(tibble(
+  varivavel = c(
+    'fx',
+    "commodity_fertilizers",
+    'soybean_prod',
+    'el_nino',
+    'exp_value',
+    'soybean_global_price',
+    'soybean_price'
+  ),
+  descricao = c(
+    'Taxa de câmbio',
+    'Preço de fertilizante',
+    "Produção doméstica de soja",
+    "El Ninõ",
+    "Valor das exportações de soja",
+    "Preço internacional da soja",
+    "Preço doméstico da soja"
+  )
+))
+
+```
+
+
+
+# Exploração e Pré-processamento
+
+- Tendo em vista as diferentes escalas das variáveis, o primeiro passo consiste em aplicar a transformação logarítmica, de modo a suavizá-las e facilitar a comparação. Tal processo não foi aplicado para variável de El Ninõ.
+
+- Em segundo lugar, considerou-se o período de 2012-02-01 até 2024-12-01 para o exercício
+
+```{r}
+
+dataset_final <- dataset %>% 
+  mutate(value = if_else(series != "el_nino", log(value), value),
+         value = ts(value)) %>%
+  filter(date >= "2012-02-01" & date <= "2024-12-01")     
+
+ggplot(dataset_final, aes(x = date, y = value)) +
+  geom_line(color = "steelblue") +
+  facet_wrap( ~ series, scales = "free_y", ncol = 2) +
+  theme_minimal() +
+  labs(title = "Time Series", x = "Time", y = "Value")
+
+```
+
+## Estacionariedade
+
+No universo das séries temporais, o princípio da estacionariedade é fundamental para assegurar a robustez do processo estocástico gerador dos dados. Nesse sentido, utilizou-se o teste ADF para verificar se tal propriedade é atendida.
+
+```{r}
+
+series <- unique(dataset_final$series)
+
+adf_test_list <- list()
+
+for (i in series) {
+  
+  adf_data <- dataset_final %>%
+    filter(series == i) %>%
+    pull(value) %>%
+    na.omit()
+  
+  if(length(adf_data) > 0){
+    adf_test_list[[i]] <- adf.test(adf_data)
+  } else {
+    adf_test_list[[i]] <- NA
+  }
+  
+}
+
+adf_summary <- data.frame(
+  series = names(adf_test_list),
+  test_stat = sapply(adf_test_list, function(x) if(is.list(x)) x$statistic else NA),
+  p_value   = sapply(adf_test_list, function(x) if(is.list(x)) x$p.value else NA),
+  stationary = sapply(adf_test_list, function(x) if(is.list(x)) x$p.value < 0.05 else NA)
+)
+
+adf_summary %>%
+  mutate(series = gsub("\\.Dickey-Fuller$", "", as.character(series))) %>%
+  kable(row.names = FALSE,caption = "Resultado Teste ADF - 1º Rodada")
+
+```
+
+- Pelo resultado acima, é evidente que algumas séries não são estacionárias, dado o valor = "False" na coluna stationary . Nesse sentido, cabe aplicar a primeira diferença entre elas para assegurar a estacionariedade.
+
+```{r}
+
+dataset_stationary <- dataset_final %>%
+  group_by(series) %>%
+  mutate(value = if_else(
+    series %in% c("soybean_price", "fx", "commodity_fertilizers", "el_nino",'soybean_global_price'),
+    value - lag(value),
+    value
+  )) %>%
+  ungroup()
+
+
+first_dif_adf_test_list <- list()
+
+for (i in series) {
+  
+  adf_data <- dataset_stationary %>%
+    filter(series == i) %>%
+    pull(value) %>%
+    na.omit()
+  
+  if(length(adf_data) > 0){
+    first_dif_adf_test_list[[i]] <- adf.test(adf_data)
+  } else {
+    first_dif_adf_test_list[[i]] <- NA
+  }
+  
+}
+
+adf_stationary_summary <- data.frame(
+  series = names(first_dif_adf_test_list),
+  test_stat = sapply(first_dif_adf_test_list, function(x) if(is.list(x)) x$statistic else NA),
+  p_value   = sapply(first_dif_adf_test_list, function(x) if(is.list(x)) x$p.value else NA),
+  stationary = sapply(first_dif_adf_test_list, function(x) if(is.list(x)) x$p.value < 0.05 else NA)
+)
+
+adf_stationary_summary %>%
+  mutate(series = gsub("\\.Dickey-Fuller$", "", as.character(series))) %>%
+  kable(row.names = FALSE,caption = "Resultado Teste ADF - 2º Rodada")
+
+ggplot(dataset_stationary, aes(x = date, y = value)) +
+  geom_line(color = "steelblue") +
+  facet_wrap( ~ series, scales = "free_y", ncol = 2) +
+  theme_minimal() +
+  labs(title = "Time Series", x = "Time", y = "Value")
+
+```
+
+- Como a série de "commodity_fertilizers" ainda não é estacionária, tomou-se a segunda diferença.
+
+```{r}
+
+dataset_stationary_final <- dataset_stationary %>%
+  group_by(series) %>%
+  mutate(
+    value = if_else(
+      series == "commodity_fertilizers",
+      value - lag(value, 2),  
+      value                  
+    )
+  ) %>%
+  ungroup()
+
+second_dif_adf_test_list <- list()
+
+for (i in series) {
+  
+  adf_data <- dataset_stationary_final %>%
+    filter(series == i) %>%
+    pull(value) %>%
+    na.omit()
+  
+  if(length(adf_data) > 0){
+    second_dif_adf_test_list[[i]] <- adf.test(adf_data)
+  } else {
+    second_dif_adf_test_list[[i]] <- NA
+  }
+  
+}
+
+adf_stationary_final_summary <- data.frame(
+  series = names(second_dif_adf_test_list),
+  test_stat = sapply(second_dif_adf_test_list, function(x) if(is.list(x)) x$statistic else NA),
+  p_value   = sapply(second_dif_adf_test_list, function(x) if(is.list(x)) x$p.value else NA),
+  stationary = sapply(second_dif_adf_test_list, function(x) if(is.list(x)) x$p.value < 0.05 else NA)
+)
+
+adf_stationary_final_summary %>%
+  mutate(series = gsub("\\.Dickey-Fuller$", "", as.character(series))) %>%
+  kable(row.names = FALSE,,caption = "Resultado Teste ADF - 3º Rodada")
+
+ggplot(dataset_stationary_final, aes(x = date, y = value)) +
+  geom_line(color = "steelblue") +
+  facet_wrap( ~ series, scales = "free_y", ncol = 2) +
+  theme_minimal() +
+  labs(title = "Time Series", x = "Time", y = "Value")
+
+```
+
+## Decomposição
+
+- Pelo lado da decomposição, verificou-se que as séries apresentam uma tendência suave e um padrão de sazonalidade bem definido, enquanto a componente aleatório encontra-se relativamente controlada.
+
+```{r, fig.height = 12, fig.width = 12}
+
+series_list <- unique(dataset_stationary_final$series)
+
+stl_plots <- list()
+
+for(s in series_list){
+  
+  df <- dataset_stationary_final %>%
+    filter(series == s) %>%
+    arrange(date)
+  
+  if(sum(!is.na(df$value)) < 24) next  
+  
+  values_no_na <- df$value[!is.na(df$value)]
+  dates_no_na <- df$date[!is.na(df$value)]
+  
+  ts_series <- ts(values_no_na,
+                  start = c(year(min(dates_no_na)), month(min(dates_no_na))),
+                  frequency = 12)
+  
+  stl_res <- stl(ts_series, s.window = "periodic", t.window = 12, robust = TRUE)
+  
+  stl_df <- as.data.frame(stl_res$time.series)
+  stl_df$date <- dates_no_na
+  stl_df <- stl_df %>%
+    pivot_longer(cols = -date, names_to = "component", values_to = "value")
+  
+
+  p <- ggplot(stl_df, aes(x = date, y = value, color = component)) +
+    geom_line() +
+    facet_wrap(~component, scales = "free_y", ncol = 1) +
+    labs(title = paste("Decomposição STL", s)) +
+    theme_minimal()
+  
+  stl_plots[[s]] <- p
+}
+
+wrap_plots(stl_plots, ncol = 2) 
+
+```
+
+## Quebra Estrutural
+
+- No que se refere a quebras estruturais, aplicou-se o teste CUSUM, que avalia a estabilidade dos coeficientes ao longo do tempo, detectando mudanças abruptas ou tendências sistemáticas. Embora algumas séries possam apresentar quebras individuais, a análise agregada, considerando o comportamento do preço da soja, não indicou mudanças de regime significativas, sugerindo que o modelo mantém sua validade ao longo do período analisado. 
+
+```{r}
+
+df_model <- dataset_stationary_final %>%
+  pivot_wider(
+    names_from = series,
+    values_from = value
+  )
+
+plot (efp(
+  soybean_price ~ fx + commodity_fertilizers + exp_value + soybean_prod + el_nino,
+  data = df_model,
+  type = "Rec-CUSUM",
+  h = 0.15), main = "CUSUM - Modelo", alpha = 0.01)
+
+
+
+
+```
+
+
+# Modelo
+
+- Para a estimação, considerou-se o preço da soja como variável dependente (Y) e os demais regressores do dataset como variáveis exógenas. Dessa forma, optou-se por um modelo ARIMA(1,0,0)(2,0,0), com AR(1) na componente não sazonal e AR(2) na componente sazonal.
+
+```{r}
+
+soybean_ts <- ts(df_model$soybean_price, start = c(2012, 2), frequency = 12)
+
+xreg <- df_model %>%
+  dplyr::select(fx, commodity_fertilizers, soybean_prod, exp_value, el_nino,soybean_global_price) %>%
+  as.matrix()
+
+fit_arima <- auto.arima(soybean_ts, xreg = xreg)
+
+checkresiduals(fit_arima)
+summary(fit_arima)
+
+
+
+```
+
+
+- A análise dos resíduos indica que eles se comportam como ruído branco, apresentando média próxima de zero e variância constante. O teste de Ljung-Box confirmou a ausência de autocorrelação significativa, com p-valor superior a 0,05. Além disso, o modelo apresentou um RMSE reduzido, sugerindo bom ajuste aos dados observados. Portanto, podemos considerar que o modelo está adequadamente especificado e ajusta-se bem à série histórica do preço da soja, mesmo que o correlograma dos resíduos (ACF) apresente um spike isolado fora do intervalo de confiança no lag 25, o qual pode ser interpretado como efeito aleatório despresível.
+
+
+
+# Análise Econômica
+
+```{r}
+
+
+kable(
+  round(coef(fit_arima), 2),
+  caption = "Coeficientes do modelo ARIMA",
+  col.names = c("Coeficiente", "Valor")
+)
+
+
+
+```
+
+
+- A partir dos resultados do modelo, observa-se que as variáveis que mais influenciam o preço da soja no mercado doméstico são o câmbio e o preço internacional da soja. No caso do câmbio, considerando que grande parte da produção brasileira é destinada à exportação, maiores ganhos no mercado externo tendem a reduzir a oferta doméstica, pressionando os preços internos. Nesse sentido, um aumento de 1 R\$/USD no câmbio eleva o preço da soja em aproximadamente 0,16 R\$/60 kg. Quanto ao preço internacional, como o mercado doméstico acompanha os preços externos, há incentivos para ajustar o preço de venda internamente, de forma que um aumento de 1 USD/t no preço internacional eleva o preço doméstico em cerca de 0,63 R\$/60 kg.
+
+- No que diz respeito às demais variáveis analisadas, o modelo não apresentou efeitos tão relevantes sobre o preço da soja. Entretanto, é plausível esperar que o El Niño e o preço dos fertilizantes exerçam um efeito defasado, pois tendem a impactar a produtividade da colheita de soja, o que posteriormente influencia os preços via oferta da commodity. Uma alternativa para validar essa hipótese seria incluir lags dessas variáveis no modelo e verificar seu efeito sobre o preço.
+
+- Quanto à produção de soja, o modelo segue o racional de que, quanto maior a oferta, menor tende a ser o preço. Por fim, o aumento das exportações de soja tende a gerar uma pequena diminuição dos preços, uma vez que, quanto maior a oferta do item globalmente, o efeito sobre o preço internacional é negativo e, portanto, afetando o preço doméstico.
+
+
+## Elasticidade-preço do câmbio e do preço internacional da soja
+
+Para entender a sensibilidade do preço doméstico da soja em relação às variáveis explicativas, podemos calcular a **elasticidade-preço**, definida como:
+
+$$
+E_X = \frac{\Delta P / P}{\Delta X / X} \approx \beta \cdot \frac{\bar{X}}{\bar{P}}
+$$
+
+onde:  
+
+- \(E_X\) = elasticidade-preço do **preço doméstico da soja** em relação à variável \(X\)  
+- \(\Delta P\) = variação no **preço doméstico da soja (R$/60 kg)**  
+- \(\Delta X\) = variação na variável explicativa \(X\)  
+  - Para câmbio (R\$/USD)  
+  - Para preço internacional(R\$/60 kg)  
+- \(\bar{P}\) = preço médio da soja doméstica no período (R$/60 kg)  
+- \(\bar{X}\) = valor médio da variável explicativa  
+- \(\beta\) = coeficiente estimado do modelo ARIMA para a variável \(X\)  
+
+
+
+```{r}
+
+# Média do preço doméstico (R$/60 kg)
+P_bar <- mean(df_model$soybean_price, na.rm = TRUE)
+
+# Média do câmbio (R$/USD)
+fx_bar <- mean(df_model$fx, na.rm = TRUE)
+
+# Média do preço internacional (R$/60 kg)
+global_bar <- mean(df_model$soybean_global_price, na.rm = TRUE)
+
+
+# Coeficientes
+coef_model <- coef(fit_arima)
+
+beta_fx <- coef_model["fx"]
+beta_global <- coef_model["soybean_global_price"]
+
+
+# Elasticidade em relação ao câmbio
+E_fx <- beta_fx * fx_bar / P_bar
+
+# Elasticidade em relação ao preço internacional
+E_global <- beta_global * global_bar / P_bar
+
+elasticidades <- tibble(
+  Variável = c("Elasticidade Câmbio", "Elasticidade Preço Global"),
+  Valor = c(E_fx, E_global)
+)
+
+
+kable(elasticidades, digits = 2,caption = "Elasticidades")
+```
+
+- A elasticidades das variáveis analisadas vem em linha com parâmetros gerados pelo modelo.
+
+- **Taxa de câmbio**: Um aumento de 1% no câmbio (R$/USD) eleva o preço doméstico da soja em 0,21%.
+Isso indica que o preço doméstico é moderadamente sensível às variações cambiais.
+
+- **Preço internacional da soja**: Um aumento de 1% no preço global da soja eleva o preço doméstico em 0,61%. Isso mostra que o preço interno acompanha fortemente o mercado internacional, com sensibilidade relativamente alta. Ou seja, mudanças no preço internacional têm impacto direto e significativo sobre o preço doméstico. 
+
+
+# Cenário What-If
+
+```{r}
+# Horizonte de previsão
+h <- 12  
+
+
+last_xreg <- tail(xreg, 1)
+
+
+xreg_base <- matrix(rep(last_xreg, h), nrow = h, byrow = TRUE)
+
+
+if(is.null(colnames(xreg))){
+  colnames(xreg_base) <- c("fx", "commodity_fertilizers", "soybean_prod", "exp_value", "el_nino", "soybean_global_price")
+} else {
+  colnames(xreg_base) <- colnames(xreg)
+}
+
+# Cenário 1: câmbio desvalorizado 10%
+xreg_fx_up <- xreg_base
+xreg_fx_up[, "fx"] <- xreg_fx_up[, "fx"] * 1.10  # aumento de 10%
+
+# Cenário 2: preço internacional da soja cai 15%
+xreg_price_down <- xreg_base
+xreg_price_down[, "soybean_global_price"] <- xreg_price_down[, "soybean_global_price"] * 0.85
+
+# Previsões
+fc_base <- forecast(fit_arima, xreg = xreg_base, h = h)
+fc_fx_down <- forecast(fit_arima, xreg = xreg_fx_up, h = h)
+fc_price_down <- forecast(fit_arima, xreg = xreg_price_down, h = h)
+
+
+df_plot <- data.frame(
+  date = time(fc_base$mean),
+  Base = as.numeric(fc_base$mean),
+  Fx_UP = as.numeric(fc_fx_down$mean),
+  Price_Down = as.numeric(fc_price_down$mean)
+) %>%
+  pivot_longer(cols = -date, names_to = "Scenario", values_to = "Price")
+
+
+ggplot(df_plot, aes(x = date, y = Price, color = Scenario)) +
+  geom_line(size = 1) +
+  geom_point(size = 1.5) +
+  labs(
+    title = "Simulação de Cenários - Preço da Soja (R$/ 60kg)",
+    x = "Ano",
+    y = "Preço da Soja",
+    color = "Cenário"
+  ) +
+  theme_minimal() +
+  theme(text = element_text(size = 12))
+
+```
+
+
+- Para a simulação do cenário What-If, considerou-se um horizonte de tempo de 12 meses, de modo que os efeitos dos choques ocorrem ao longo do ano de 2025.
+
+- No que se refere ao choque aplicado ao câmbio, uma desvalorização do real frente ao dólar tende a elevar o preço doméstico da saca de 60 kg de soja em comparação ao cenário básico, que pressupõe todas as demais variáveis constantes. A dinâmica observada nesse cenário está consistente com o modelo, evidenciando o efeito positivo do câmbio sobre o preço doméstico da soja. Nesse sentido, uma variação positiva do câmbio pode gerar incentivos para maior produção e exportação, uma vez que a rentabilidade da venda externa tende a aumentar. Por outro lado, devido à menor oferta doméstica, observa-se uma redução da disponibilidade de soja no mercado interno, o que, consequentemente, tende a pressionar o preço para cima.  
+
+- Quanto ao choque aplicado ao preço internacional da soja, as evidências indicam uma queda no preço doméstico frente ao cenário básico. A relação entre as variáveis é positiva, sendo o preço internacional um dos principais vetores que impacta o preço interno da commodity. Portanto, uma redução de preços pode incentivar a diminuição da produção, uma vez que a rentabilidade tende a cair, ao passo que a demanda pelo produto no mercado interno pode se manter estável ou até aumentar, devido ao menor preço. Esse ajuste no equilíbrio entre oferta e demanda tende a conter parcialmente a queda de preços domésticos, mas evidencia a forte sensibilidade do mercado interno às variações internacionais.
+
