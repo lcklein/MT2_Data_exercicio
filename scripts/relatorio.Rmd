@@ -51,6 +51,28 @@ Em síntese, a empresa deve adotar estratégias de hedge cambial e de preço ali
 
 # 1) Pacotes -------------------------------------------
 
+
+# Lista de pacotes
+pacotes <- c(
+  "tidyverse",
+  "janitor",
+  "readxl",
+  "tseries",
+  "forecast",
+  "knitr",
+  "patchwork",
+  "strucchange"
+)
+
+# Instala apenas os que faltam
+instalar <- pacotes[!(pacotes %in% installed.packages()[,"Package"])]
+if(length(instalar)) install.packages(instalar, dependencies = TRUE)
+
+# Carrega todos
+lapply(pacotes, library, character.only = TRUE)
+
+
+
 library('tidyverse')
 library('janitor')
 library('readxl')
