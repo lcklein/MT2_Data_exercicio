@@ -1,0 +1,940 @@
+---
+title: "Exercício 2"
+author: "Luca Klein"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(message = FALSE)
+knitr::opts_chunk$set(warning  = FALSE)
+
+
+```
+
+
+
+<!-- ```{r, echo=FALSE} -->
+
+
+<!-- # Lista de pacotes -->
+<!-- pacotes <- c( -->
+<!--   "tidyverse", -->
+<!--   "janitor", -->
+<!--   "readxl", -->
+<!--   "tseries", -->
+<!--   "forecast", -->
+<!--   "knitr", -->
+<!--   "patchwork", -->
+<!--   "strucchange", -->
+<!--   "prophet", -->
+<!--   "combinat", -->
+<!--   "xgboost" -->
+<!-- ) -->
+
+<!-- # Instala apenas os que faltam -->
+<!-- instalar <- pacotes[!(pacotes %in% installed.packages()[,"Package"])] -->
+<!-- if(length(instalar)) install.packages(instalar, dependencies = TRUE) -->
+
+<!-- # Carrega todos -->
+<!-- lapply(pacotes, library, character.only = TRUE) -->
+
+<!-- ``` -->
+
+
+# Introdução
+
+- Para o presente exercício, utilizou-se a mesma configuração de dados do exercício anterior.
+
+- Os métodos escolhidos foram ARIMA, Prophet e XGBoost, todos estimados com variáveis exógenas.
+
+- A dinâmica do exercício consistiu em rodar uma corrida de modelos para cada método e selecionar o melhor deles a partir do RMSE fora da amostra (dados de teste). Posteriormente, para o melhor modelo de cada método, aplicou-se validação cruzada e tomou-se a média das medidas de acurácia a fim de identificar o melhor método. 
+
+- No que se refere ao valores de teste dos modelos, adotou-se o ano de 2024 (últimos 12 meses) como as previsões a serem validadas.
+
+- Como algumas variáveis exógenas apresentavam valores faltantes, optou-se por preenchê-los utilizando a média dos valores observados nos três anos subsequentes para o mesmo mês de referência. Esse procedimento resultou em ajustes consistentes, cuja qualidade pode ser observada na visualização do modelo ARIMA. 
+ 
+
+
+# Dados
+
+- Os dados tem a mesma configuração do exercício anterior, sendo assim considerou-se o período de 2012-02-01 até 2024-12-01 com os dados já estacionários.
+
+```{r}
+
+
+# 1) Pacotes -------------------------------------------
+
+library('tidyverse')
+library('janitor')
+library('readxl')
+library("tseries")
+library("forecast")
+library('knitr')
+library("patchwork")
+library("strucchange")
+library("combinat")
+library("prophet")
+library("xgboost")
+
+
+# 2) Dados -----------------------------------------------------------------
+
+# Alterar esse endereço para reprodução do relatório
+caminho_dados <- "C:/Users/lucac/OneDrive/Documentos/MT2_Data_exercicio/inputs/data.xlsx"
+
+# 2.1) Preço da soja ------------------------------------------------------
+
+soybean_price <- read_excel(caminho_dados, sheet = "soybean_price") %>%
+  clean_names() %>%
+  mutate(date = if (is.numeric(date)) {
+    as.Date(date, origin = "1899-12-30")
+  } else {
+    as.Date(date, tryFormats = c("%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y"))
+  }) %>%
+  mutate(year  = year(date), month = month(date)) %>%
+  group_by(year, month) %>%
+  summarise(soybean_price = mean(soybean_price, na.rm = TRUE),
+            .groups = "drop") %>%
+  mutate(date = as.Date(sprintf("%04d-%02d-01", year, month))) %>%
+ dplyr::select(-year,-month)
+
+# 2.2) Valor das exportações de soja ----------------------------------------------
+
+soybean_exp_value <- read_excel(
+  caminho_dados,
+  sheet = 'exp_value'
+) %>%
+  clean_names() %>%
+  mutate(date = as.Date(paste0("01/", date), format = "%d/%m/%Y")) %>% 
+arrange(date)
+
+
+# 2.3) Valor das exportações de soja ----------------------------------------------
+
+soybean_global_price <- read_excel(
+  caminho_dados,
+  sheet = 'soybean_global_price'
+) %>% clean_names()
+
+
+# 2.3) Dados do exercício  ----------------------------------------------
+
+data_raw <- read_excel(caminho_dados) %>%
+  clean_names() %>%
+  rename(
+    fx = bcb_external_sec_exchange_rate_dolar_month_avg,
+    commodity_fertilizers = wb_commodity_fertilizers,
+    el_nino = noaa_oni,
+    soybean_prod = ibge_lspa_soybean_production
+  )
+
+
+# 2.4) Dataset ------------------------------------------------------------
+
+dataset <- data_raw %>%
+  left_join(soybean_exp_value, by = "date") %>%
+  left_join(soybean_global_price, by = "date") %>%
+  left_join(soybean_price, by = "date") %>%
+  mutate(soybean_global_price = soybean_global_price * fx * 0.06,
+         exp_value = exp_value*fx) %>%
+  pivot_longer(
+    cols = -c(date),
+    names_to = "series",
+    values_to = "value"
+  )
+
+dataset_final <- dataset %>% 
+  mutate(value = if_else(series != "el_nino", log(value), value),
+         value = ts(value)) %>%
+  filter(date >= "2012-02-01" & date <= "2024-12-01") 
+
+
+dataset_stationary <- dataset_final %>%
+  group_by(series) %>%
+  mutate(value = if_else(
+    series %in% c("soybean_price", "fx", "commodity_fertilizers", "el_nino",'soybean_global_price'),
+    value - lag(value),
+    value
+  )) %>%
+  ungroup()
+
+
+dataset_stationary_final <- dataset_stationary %>%
+  group_by(series) %>%
+  mutate(
+    value = if_else(
+      series == "commodity_fertilizers",
+      value - lag(value, 2),  
+      value                  
+    )
+  ) %>%
+  ungroup()
+
+
+ggplot(dataset_stationary_final, aes(x = date, y = value)) +
+  geom_line(color = "steelblue") +
+  facet_wrap( ~ series, scales = "free_y", ncol = 2) +
+  theme_minimal() +
+  labs(title = "Time Series", x = "Time", y = "Value")
+
+
+```
+
+# Arima
+
+- O primeiro passo para selecionar os termos AR e MA se dá pelos testes PACF e ACF, respectivamente. Para o termo AR, observa-se que o PACF apresenta truncamento no primeiro lag, indicando a inclusão de um termo autoregressivo de primeira ordem (AR(1)). Quanto ao termo MA, a ACF apresenta decaimento exponencial ao longo de dois lags, sugerindo a inclusão de um termo de média móvel de segunda ordem (MA(2)).
+
+
+
+
+```{r}
+
+df_model <- dataset_stationary_final %>%
+  pivot_wider(
+    names_from = series,
+    values_from = value
+  )
+
+soybean_ts <- ts(df_model$soybean_price, start = c(2012, 2), frequency = 12) 
+
+xreg <- df_model %>%
+  dplyr::select(fx, commodity_fertilizers, soybean_prod, exp_value, el_nino,soybean_global_price) %>%
+  as.matrix()
+
+pacf(na.omit(df_model$soybean_price))
+acf(na.omit(df_model$soybean_price))
+
+
+
+```
+
+
+- O próximo passo é realizar uma corrida de modelos para verificar os resíduos, informações de critérios de seleção e métricas de acurária. Para tal, vamos criar 5 especicações de modelos para com base nos teste realizados acima e na especificação do modelo sugerido pela função de auto.arima (modelo do primeiro exercício - ARIMA (1,0,0)(2,0,0)) 
+
+- Adicionalmente, preencheu-se os dados faltantes das variáveis exógenas pela média de valores dos 3 anos subsequetes para o mês de referência.
+
+
+```{r}
+# Recortes de treino e teste
+
+n_total <- length(soybean_ts)
+n_test  <- 12  # últimos 12 meses para teste
+
+# Número de observações de treino
+n_train <- n_total - n_test  
+
+
+end_train  <- time(soybean_ts)[n_total - n_test]
+start_test <- time(soybean_ts)[n_total - n_test + 1]
+
+# Inputs
+
+# Variável independente
+train_ts <- window(soybean_ts, end = end_train)
+test_ts  <- window(soybean_ts, start = start_test)
+
+# Variáveis exógenas
+xreg_train_incompleto <-as.tibble(xreg[1:(n_total - n_test), , drop = FALSE])
+xreg_test  <- as.matrix(xreg[(n_total - n_test + 1):n_total, , drop = FALSE])
+
+
+# Criar médias de 12 meses à frente para os 36 primeiros meses
+xreg_train <- xreg_train_incompleto %>%
+  mutate(across(
+    everything(),
+    ~ {
+      # substitui NAs apenas nos 36 primeiros meses
+      v <- .
+      for (i in 1:36) {
+        if (is.na(v[i])) {
+          # média dos próximos 12 meses disponíveis
+          v[i] <- mean(v[(i+1):(min(i+12, length(v)))], na.rm = TRUE)
+        }
+      }
+      # para os demais, mantém imputação pela média global
+      v <- ifelse(is.na(v), mean(v, na.rm = TRUE), v)
+      v
+    }
+  ))
+
+par(mfrow = c(2, 2)) 
+
+
+for (var in colnames(xreg)) {
+  plot(xreg[1:n_train, var], type = "l", main = paste("Antes -", var))
+  plot(xreg_train[[var]], type = "l", main = paste("Depois -", var))
+}
+
+
+
+
+
+# Modelos
+
+model_list <- list(
+  ARIMA_1_0_0       = arima(train_ts, order = c(1,0,0), seasonal = c(0,0,0), xreg = xreg_train),
+  ARIMA_0_0_2       = arima(train_ts, order = c(0,0,2), seasonal = c(0,0,0), xreg = xreg_train),
+  ARIMA_1_0_2       = arima(train_ts, order = c(1,0,2), seasonal = c(0,0,0), xreg = xreg_train),
+  ARIMA_1_0_0_2_0_0 = arima(train_ts, order = c(1,0,0), seasonal = c(2,0,0), xreg = xreg_train),
+  ARIMA_1_0_2_2_0_0 = arima(train_ts, order = c(1,0,2), seasonal = c(2,0,0), xreg = xreg_train),
+  ARIMA_0_0_2_2_0_0 = arima(train_ts, order = c(0,0,2), seasonal = c(2,0,0), xreg = xreg_train)
+)
+
+
+# Diagnóstico dos resíduos
+
+par(mfrow = c(2, 3)) 
+
+for(nome in names(model_list)) {
+  res <- residuals(model_list[[nome]])
+  res <- na.omit(res)   # remover NAs
+  acf(res, main = paste("ACF Resíduos -", nome))
+}
+
+
+
+
+get_coefs <- function(model, nome_modelo) {
+  coefs <- coef(model)  
+  tibble(
+    Modelo = nome_modelo,
+    Coeficiente = names(coefs),
+    Valor = as.numeric(coefs)
+  )
+}
+
+
+coef_list <- lapply(names(model_list), function(nome) {
+  get_coefs(model_list[[nome]], nome)
+})
+
+coef_tibble <- bind_rows(coef_list)
+
+
+coef_wide <- coef_tibble %>%
+  pivot_wider(names_from = Coeficiente, values_from = Valor)
+
+
+kable(coef_wide, digits = 4)
+```
+
+
+
+- De modo geral, os modelos apresentaram bom desempenho preditivo, sendo o ARIMA(1,0,0) o melhor deles segundo o RMSE fora da amostra. Em comparação com o exercício anterior, observa-se que as diferenças entre o melhor modelo da corrida e o ARIMA(1,0,0)(2,0,0) não geram implicações relevantes para a performance das previsões. Assim, por conveniência e em razão das métricas ligeiramente superiores de acurácia, optou-se por adotar o modelo selecionado na corrida com o melhor do método.
+
+
+```{r}
+
+
+# Função de métricas de validação
+
+get_metrics <- function(model, nome_modelo) {
+  
+  res <- residuals(model)
+  rmse_in <- sqrt(mean(res^2, na.rm = TRUE))
+  
+
+  fc <- predict(model, n.ahead = n_test, newxreg = xreg_test)
+  
+  rmse_out <- sqrt(mean((test_ts - fc$pred)^2, na.rm = TRUE))
+  mae_out  <- mean(abs(test_ts - fc$pred), na.rm = TRUE)
+  mape_out <- mean(abs((test_ts - fc$pred)/test_ts)) * 100
+  
+
+  lb_test <- Box.test(res, lag = 12, type = "Ljung-Box")
+  lb_pval <- lb_test$p.value
+  
+  tibble(
+    Modelo     = nome_modelo,
+    RMSE_in    = round(rmse_in, 4),
+    RMSE_out   = round(rmse_out, 4),
+    MAE_out    = round(mae_out, 4),
+    MAPE_out   = round(mape_out, 4),
+    AIC        = round(AIC(model), 4),
+    BIC        = round(BIC(model), 4),
+    LjungBox_p = round(lb_pval, 4)
+  )
+}
+
+
+
+# Tabela de métricas de validação
+metrics_tibble <- bind_rows(
+  lapply(names(model_list), function(nome) get_metrics(model_list[[nome]], nome))
+)
+kable(metrics_tibble)
+
+
+
+
+# Gráficos de previsão vs real
+
+forecast_list <- lapply(model_list, function(mod) {
+  predict(mod, n.ahead = n_test, newxreg = xreg_test)$pred
+})
+
+plot_df <- data.frame(
+  ds                   = time(test_ts),
+  real                 = as.numeric(test_ts),
+  ARIMA_1_0_0          = as.numeric(forecast_list[[1]]),
+  ARIMA_0_0_2          = as.numeric(forecast_list[[2]]),
+  ARIMA_1_0_2          = as.numeric(forecast_list[[3]]),
+  ARIMA_1_0_0_2_0_0    = as.numeric(forecast_list[[4]]),
+  ARIMA_1_0_2_2_0_0    = as.numeric(forecast_list[[5]])
+)
+
+plot_df_long <- plot_df %>%
+  pivot_longer(cols = -ds, names_to = "Modelo", values_to = "Valor")
+
+ggplot(plot_df_long, aes(x = ds, y = Valor, color = Modelo)) +
+  geom_line(size = 1) +
+  labs(title = "Previsão vs valores reais",
+       x = "Mês", y = "Preço da soja") +
+  theme_minimal()
+
+
+```
+
+# Prophet
+
+
+- Para a aplicação do Prophet, utilizou-se o mesmo conjunto de dados do modelo anterior. Entretanto, a corrida de modelos foi implementada por meio de um loop, que gerou todas as combinações possíveis de variáveis exógenas. A partir dessas combinações, foram selecionados os cinco melhores modelos com base no critério de acurácia de menor RMSE fora da amostra. 
+
+```{r}
+
+# Preparar série temporal
+
+df_prophet_pp <- df_model %>%
+  mutate(ds = date,
+         y = soybean_price) %>%
+  select(ds, y)
+
+n_total_pp <- nrow(df_prophet_pp)
+n_test_pp  <- 12
+n_train_pp <- n_total_pp - n_test_pp
+
+train_df_pp <- df_prophet_pp[1:n_train_pp, ]
+test_df_pp  <- df_prophet_pp[(n_train_pp + 1):n_total_pp, ]
+
+# Preparar regressores exógenos
+
+xreg_names_pp <- colnames(xreg)
+
+xreg_train_pp <- xreg[1:n_train_pp, , drop = FALSE] %>%
+  as.data.frame() %>%
+  mutate(across(everything(), ~ ifelse(is.na(.), mean(., na.rm = TRUE), .)))
+
+xreg_test_pp <- xreg[(n_train_pp + 1):n_total_pp, , drop = FALSE] %>%
+  as.data.frame() %>%
+  mutate(across(everything(), ~ ifelse(is.na(.), mean(., na.rm = TRUE), .)))
+
+# Função para rodar Prophet dado um subconjunto de regressores
+
+rodar_prophet_pp <- function(vars_pp) {
+  df_train_pp_comb <- bind_cols(train_df_pp, xreg_train_pp[, vars_pp, drop = FALSE])
+  
+  m_pp <- prophet(yearly.seasonality = TRUE, weekly.seasonality = FALSE, daily.seasonality = FALSE)
+  
+  for (v_pp in vars_pp) {
+    m_pp <- add_regressor(m_pp, v_pp)
+  }
+  
+  m_pp <- fit.prophet(m_pp, df_train_pp_comb)
+  
+  future_pp <- make_future_dataframe(m_pp, periods = n_test_pp, freq = "month")
+  
+  for (v_pp in vars_pp) {
+    future_pp[[v_pp]] <- c(xreg_train_pp[[v_pp]], xreg_test_pp[[v_pp]])
+  }
+  
+  fc_pp <- predict(m_pp, future_pp)
+  pred_out_pp <- fc_pp$yhat[(n_train_pp + 1):n_total_pp]
+  
+  res_in_pp <- train_df_pp$y - fc_pp$yhat[1:n_train_pp]
+  rmse_in_pp <- sqrt(mean(res_in_pp^2, na.rm = TRUE))
+  rmse_out_pp <- sqrt(mean((test_df_pp$y - pred_out_pp)^2, na.rm = TRUE))
+  mae_out_pp  <- mean(abs(test_df_pp$y - pred_out_pp), na.rm = TRUE)
+  mape_out_pp <- mean(abs((test_df_pp$y - pred_out_pp) / test_df_pp$y)) * 100
+  lb_test_pp  <- Box.test(res_in_pp, lag = 12, type = "Ljung-Box")
+  
+  tibble(
+    Modelo_pp     = paste("Prophet", paste(vars_pp, collapse = "+")),
+    Vars_pp       = paste(vars_pp, collapse = ", "),
+    RMSE_in_pp    = rmse_in_pp,
+    RMSE_out_pp   = rmse_out_pp,
+    MAE_out_pp    = mae_out_pp,
+    MAPE_out_pp   = mape_out_pp,
+    LjungBox_p_pp = lb_test_pp$p.value,
+    Predicoes_pp  = list(pred_out_pp)
+  )
+}
+
+
+# Rodar para todas as combinações possíveis
+
+todas_comb_pp <- unlist(
+  lapply(1:length(xreg_names_pp), function(k) combn(xreg_names_pp, k, simplify = FALSE)),
+  recursive = FALSE
+)
+
+resultados_pp <- map_dfr(todas_comb_pp, rodar_prophet_pp)
+
+
+# Selecionar os 5 melhores (menor RMSE_out)
+
+melhores_5_pp <- resultados_pp %>%
+  arrange(RMSE_out_pp) %>%
+  head(5) 
+
+kable(melhores_5_pp%>% 
+  select(-Vars_pp,-Predicoes_pp))
+
+
+# Plot
+
+plot_df_pp <- tibble(
+  ds_pp   = test_df_pp$ds,
+  real_pp = test_df_pp$y
+)
+
+for (i in 1:nrow(melhores_5_pp)) {
+  nome_modelo_pp <- paste0("Prophet_", i, " (RMSE=", round(melhores_5_pp$RMSE_out_pp[i], 2), ")")
+  plot_df_pp[[nome_modelo_pp]] <- melhores_5_pp$Predicoes_pp[[i]]
+}
+
+plot_df_long_pp <- plot_df_pp %>%
+  pivot_longer(cols = -ds_pp, names_to = "Modelo", values_to = "Valor")
+
+
+ggplot(plot_df_long_pp, aes(x = ds_pp, y = Valor, color = Modelo)) +
+  geom_line(size = 1) +
+  scale_color_manual(
+    values = c(
+      "real_pp" = "black",
+      setNames(RColorBrewer::brewer.pal(5, "Set1"), colnames(plot_df_pp)[-c(1,2)])
+    )
+  ) +
+  labs(title = "Previsão Prophet (Top 5 modelos) vs valores reais",
+       x = "Mês", y = "Preço da soja") +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    legend.title = element_blank(),
+    plot.title = element_text(face = "bold", size = 14)
+  )
+
+
+```
+
+# XGboost
+
+- Da mesma forma do modelo anterior, aplicou-se um loop para gerar combinações de variáveis exógenas e seleciou-se os 5 melhores modelos segundo os critérios de acurária. Adicionalmente, implementou-se lags de até 12 meses nas variáveis exógenas para determinar se existe alguma dependência temporal.
+
+```{r}
+
+# Preparar série temporal
+
+df_xgb <- df_model %>%
+  mutate(ds = date,
+         y = soybean_price) %>%
+  select(ds, y)
+
+n_total <- nrow(df_xgb)
+n_test  <- 12
+n_train <- n_total - n_test
+
+train_y <- df_xgb$y[1:n_train]
+test_y  <- df_xgb$y[(n_train+1):n_total]
+
+
+# Criar lags
+
+lags <- 1:12  
+
+create_lags <- function(x, lags) {
+  embed(x, max(lags)+1)[, -1] 
+}
+
+train_lags <- create_lags(train_y, lags)
+test_lags  <- create_lags(df_xgb$y, lags)  
+
+# Ajustar labels do treino e teste
+train_y_lagged <- train_y[(max(lags)+1):n_train]
+test_y_lagged  <- test_y
+
+# Regressores exógenos
+
+xreg_names <- colnames(xreg)
+
+xreg_train <- xreg[1:n_train, , drop = FALSE] %>%
+  as.data.frame() %>%
+  mutate(across(everything(), ~ ifelse(is.na(.), mean(., na.rm = TRUE), .)))
+
+xreg_test <- xreg[(n_train+1):n_total, , drop = FALSE] %>%
+  as.data.frame() %>%
+  mutate(across(everything(), ~ ifelse(is.na(.), mean(., na.rm = TRUE), .)))
+
+# Ajustar tamanho do xreg para combinar com os lags
+xreg_train_lagged <- xreg_train[(max(lags)+1):n_train, , drop = FALSE]
+
+
+# Função para rodar XGBoost dado um subconjunto de regressores
+
+rodar_xgb <- function(vars) {
+  train_matrix <- cbind(train_lags, xreg_train_lagged[, vars, drop = FALSE])
+  test_matrix  <- cbind(test_lags[1:n_test, ], xreg_test[, vars, drop = FALSE])
+  
+  model <- xgboost(
+    data = as.matrix(train_matrix),
+    label = train_y_lagged,
+    nrounds = 100,
+    objective = "reg:squarederror",
+    verbose = 0
+  )
+  
+  pred_out <- predict(model, as.matrix(test_matrix))
+  
+  rmse_out <- sqrt(mean((test_y_lagged - pred_out)^2, na.rm = TRUE))
+  mae_out  <- mean(abs(test_y_lagged - pred_out), na.rm = TRUE)
+  mape_out <- mean(abs((test_y_lagged - pred_out)/test_y_lagged)) * 100
+  
+  tibble(
+    Modelo   = paste("XGBoost", paste(vars, collapse = "+")),
+    Vars     = paste(vars, collapse = ", "),
+    RMSE_out = rmse_out,
+    MAE_out  = mae_out,
+    MAPE_out = mape_out,
+    Predicoes = list(pred_out)
+  )
+}
+
+
+# Testar todas as combinações de variáveis exógenas
+
+todas_comb <- unlist(
+  lapply(1:length(xreg_names), function(k) combn(xreg_names, k, simplify = FALSE)),
+  recursive = FALSE
+)
+
+resultados_xgb <- map_dfr(todas_comb, rodar_xgb)
+
+# Selecionar os 5 melhores
+melhores_5_xgb <- resultados_xgb %>%
+  arrange(RMSE_out) %>%
+  head(5)
+
+kable(melhores_5_xgb%>% 
+  select(-Vars,-Predicoes))
+
+# Plot
+
+plot_df_xgb <- tibble(
+  ds   = df_xgb$ds[(n_train+1):n_total],
+  real = test_y_lagged
+)
+
+for (i in 1:nrow(melhores_5_xgb)) {
+  nome_modelo <- paste0("XGBoost_", i, " (RMSE=", round(melhores_5_xgb$RMSE_out[i], 2), ")")
+  plot_df_xgb[[nome_modelo]] <- melhores_5_xgb$Predicoes[[i]]
+}
+
+plot_df_long_xgb <- plot_df_xgb %>%
+  pivot_longer(cols = -ds, names_to = "Modelo", values_to = "Valor")
+
+
+ggplot(plot_df_long_xgb, aes(x = ds, y = Valor, color = Modelo)) +
+  geom_line(size = 1) +
+  scale_color_manual(
+    values = c(
+      "real" = "black",
+      setNames(RColorBrewer::brewer.pal(5, "Set1"), colnames(plot_df_xgb)[-c(1,2)])
+    )
+  ) +
+  labs(title = "Previsão XGBoost (Top 5 modelos) vs valores reais",
+       x = "Mês", y = "Preço da soja") +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    legend.title = element_blank(),
+    plot.title = element_text(face = "bold", size = 14)
+  )
+
+
+```
+
+
+# Cross-Validation
+
+- Nesta etapa, selecionou-se o **melhor modelo de cada método** com base no **RMSE fora da amostra**.
+
+- Todos os modelos utilizaram **rolling window**.
+
+- Definiu-se uma **janela inicial de treino** de 60 meses (`initial = 60`) e um **horizonte de previsão** de 12 meses (`horizon = 12`).
+
+- Para cada fold:
+1. O modelo é ajustado aos dados da janela de treino.
+2. Realiza-se a previsão para o horizonte definido.
+3. Calculam-se métricas de acurácia fora da amostra: **RMSE**, **MAE** e **MAPE**.
+
+
+## Arima
+
+```{r}
+
+
+#  Parâmetros gerais
+
+initial_arima <- 60    # janela inicial de treino
+horizon_arima <- 12    # horizonte de previsão
+n_total_arima <- length(soybean_ts)  # série temporal
+
+# Melhor modelo Arima
+melhor_modelo_arima_str <- model_list$ARIMA_1_0_0
+
+
+params <- list(
+  p = melhor_modelo_arima_str$arma[1],
+  d = melhor_modelo_arima_str$arma[6],
+  q = melhor_modelo_arima_str$arma[2],
+  P = melhor_modelo_arima_str$arma[3],
+  D = melhor_modelo_arima_str$arma[7],
+  Q = melhor_modelo_arima_str$arma[4],
+  s = melhor_modelo_arima_str$arma[5]
+)
+
+
+metrics_arima_cv <- list()
+
+for(start in 1:(length(soybean_ts) - initial_arima - horizon_arima + 1)) {
+  
+  train_idx <- start:(start + initial_arima - 1)
+  test_idx  <- (start + initial_arima):(start + initial_arima + horizon_arima - 1)
+  
+  train_ts_cv <- soybean_ts[train_idx]  
+  
+  # Ajustar modelo ARIMA
+  model_cv <- Arima(
+    train_ts_cv,
+    order = c(params$p, params$d, params$q),
+    seasonal = list(order = c(params$P, params$D, params$Q), period = params$s)
+  )
+  
+  # Previsão
+  fc_cv <- forecast(model_cv, h = horizon_arima)
+  pred_cv <- fc_cv$mean
+  
+  # Métricas
+  metrics_arima_cv[[start]] <- tibble(
+    Fold = start,
+    RMSE = sqrt(mean((soybean_ts[test_idx] - pred_cv)^2, na.rm = TRUE)),
+    MAE  = mean(abs(soybean_ts[test_idx] - pred_cv), na.rm = TRUE),
+    MAPE = mean(abs((soybean_ts[test_idx] - pred_cv)/soybean_ts[test_idx]), na.rm = TRUE) * 100
+  )
+}
+
+metrics_arima_cv_df <- bind_rows(metrics_arima_cv)
+
+
+```
+
+## Prophet
+
+
+```{r}
+
+#  Parâmetros gerais
+horizon <- 12
+initial  <- 60
+metrics_prophet_cv <- list()
+
+# Melhor modelo
+melhor_modelo_pp <- unlist(strsplit(as.character(melhores_5_pp$Vars[1]), ", "))
+
+
+
+for(start in 1:(n_total_pp - initial - horizon + 1)) {
+  
+  train_idx <- start:(start + initial - 1)
+  test_idx  <- (start + initial):(start + initial + horizon - 1)
+  
+  train_df_cv <- df_prophet_pp[train_idx, ]
+  test_df_cv  <- df_prophet_pp[test_idx, ]
+  
+  df_train_reg <- bind_cols(train_df_cv, xreg_train[train_idx, melhor_modelo_pp, drop = FALSE])
+  
+  m <- prophet(yearly.seasonality = TRUE, weekly.seasonality = FALSE, daily.seasonality = FALSE)
+  for(v in melhor_modelo_pp) m <- add_regressor(m, v)
+  
+  m <- fit.prophet(m, df_train_reg)
+  
+  future <- make_future_dataframe(m, periods = horizon, freq = "month")
+  for(v in melhor_modelo_pp) future[[v]] <- c(xreg_train[train_idx, v], xreg_test[test_idx, v])
+  
+  fc <- predict(m, future)
+  pred <- fc$yhat[(initial+1):(initial+horizon)]
+  
+ metrics_prophet_cv[[start]] <- list(
+  Fold = start,
+  RMSE = sqrt(mean((test_df_cv$y - pred)^2)),
+  MAE  = mean(abs(test_df_cv$y - pred)),
+  MAPE = mean(abs((test_df_cv$y - pred)/test_df_cv$y)) * 100
+)
+ 
+}
+
+metrics_prophet_cv <- bind_rows(metrics_prophet_cv)
+
+
+```
+
+## XGboost
+
+```{r}
+
+
+#  Parâmetros gerais
+
+lags <- 1:12           # lags mensais
+initial <- 60          # janela inicial para treino
+horizon <- 12          # horizonte de previsão
+n_total_xgb <- nrow(df_model)
+
+
+# Preparar série temporal
+
+df_xgb_pp <- df_model %>%
+  mutate(ds = date,
+         y = soybean_price) %>%
+  select(ds, y)
+
+train_y_pp <- df_xgb_pp$y
+xreg_names_pp <- colnames(xreg)
+
+xreg_train_pp <- xreg %>%
+  as.data.frame() %>%
+  mutate(across(everything(), ~ ifelse(is.na(.), mean(., na.rm = TRUE), .)))
+
+# Melhor modelo
+
+melhor_modelo_xgb_pp <- strsplit(melhores_5_xgb$Vars[1], ", ")[[1]]
+
+# Lags
+
+create_lags <- function(x, lags) {
+  embed(x, max(lags)+1)[, -1]
+}
+
+
+metrics_xgb_pp_cv <- list()
+
+for(start in 1:(n_total_xgb - initial - horizon + 1)) {
+  
+  train_idx <- start:(start + initial - 1)
+  test_idx  <- (start + initial):(start + initial + horizon - 1)
+  
+  # Lags
+  train_lags_cv <- create_lags(train_y_pp[train_idx], lags)
+  test_lags_cv  <- create_lags(train_y_pp[c(train_idx, test_idx)], lags)[(initial - max(lags) + 1):(initial - max(lags) + horizon), ]
+  
+  # Regressoras exógenas
+  xreg_train_cv <- xreg_train_pp[train_idx[(max(lags)+1):length(train_idx)], melhor_modelo_xgb_pp, drop = FALSE]
+  xreg_test_cv  <- xreg_train_pp[test_idx, melhor_modelo_xgb_pp, drop = FALSE]
+  
+  # Matriz treino e teste
+  train_matrix <- cbind(train_lags_cv, xreg_train_cv)
+  test_matrix  <- cbind(test_lags_cv, xreg_test_cv)
+  
+  # Treinar modelo
+  model_cv <- xgboost(
+    data = as.matrix(train_matrix),
+    label = train_y_pp[train_idx[(max(lags)+1):length(train_idx)]],
+    nrounds = 100,
+    objective = "reg:squarederror",
+    verbose = 0
+  )
+  
+  # Previsão
+  pred_cv <- predict(model_cv, as.matrix(test_matrix))
+  
+  # Métricas
+  metrics_xgb_pp_cv[[start]] <- list(
+  Fold = start,
+  RMSE = sqrt(mean((train_y_pp[test_idx] - pred_cv)^2, na.rm = TRUE)),
+  MAE  = mean(abs(train_y_pp[test_idx] - pred_cv), na.rm = TRUE),
+  MAPE = mean(abs((train_y_pp[test_idx] - pred_cv)/train_y_pp[test_idx]), na.rm = TRUE) * 100
+)
+  
+}
+
+
+metrics_xgb_pp_cv_df <- bind_rows(metrics_xgb_pp_cv)
+
+```
+
+
+## Resumo Cross - Validation
+
+- Por fim, para selecionar o melhor método, calculou-se a **média das métricas de acurácia** de cada modelo.
+
+- A análise indica que o **XGBoost** apresenta o melhor desempenho, apresentando o **menor RMSE** entre os três métodos avaliados. Esse resultado fica ainda mais evidente na análise gráfica das previsões em comparação com os valores observados.
+
+
+```{r}
+
+# Métricas
+
+resumo_xgb <- metrics_xgb_pp_cv_df %>%
+  summarise(across(c(RMSE, MAE, MAPE), mean, na.rm = TRUE)) %>%
+  mutate(model = "XGBoost")
+
+resumo_prophet <- metrics_prophet_cv %>%
+  summarise(across(c(RMSE, MAE, MAPE), mean, na.rm = TRUE)) %>%
+  mutate(model = "Prophet")
+
+resumo_arima <- metrics_arima_cv_df %>%
+  summarise(across(c(RMSE, MAE, MAPE), mean, na.rm = TRUE)) %>%
+  mutate(model = "ARIMA")
+
+
+tabela_resumida <- bind_rows(resumo_xgb, resumo_prophet, resumo_arima) %>%
+  select(model, RMSE, MAE, MAPE)
+
+kable(tabela_resumida, caption = "Média das medidas de Acurácia")
+
+
+
+# Gráficos com as previsões
+
+prophet_forecasts <- melhores_5_pp %>% select(Predicoes_pp) %>% 
+  head(1) %>% 
+  unlist()
+
+resumo_final_plot <- plot_df_xgb %>% 
+  select(ds,real,XGBoost = 'XGBoost_1 (RMSE=0.04)') %>% 
+  bind_cols(plot_df['ARIMA_1_0_0_2_0_0']) %>% 
+  bind_cols(prophet_forecasts) %>% 
+  rename(Prophet = 5,
+         Arima = 4)
+
+resumo_final_plot_long <- resumo_final_plot %>%
+  pivot_longer(cols = c(real, XGBoost, Arima, Prophet),
+               names_to = "serie",
+               values_to = "valor")
+
+
+ggplot(resumo_final_plot_long, aes(x = ds, y = valor, color = serie)) +
+  geom_line(size = 1) +
+  labs(title = "Comparação das previsões",
+       x = "Data",
+       y = "Valor",
+       color = "Série") +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "bottom")
+
+
+```
+
